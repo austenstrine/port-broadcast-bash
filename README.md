@@ -49,20 +49,20 @@ Override bind/port with `-b` / `-p` or `PORT_BROADCAST_BIND` / `PORT_BROADCAST_P
 
 ## Multi-tab (Linux Terminal window)
 
-One regular Terminal window with N tabs (never N windows). On current Ubuntu the
-default app is **Ptyxis** (`.desktop` name “Terminal”, also `x-terminal-emulator`).
-Ptyxis cannot combine `--new-window` and `--tab` in one argv, and external
-`ptyxis --tab` follows the *active* window (easy to miss when other Terminal
-windows exist). The launcher opens one window whose first command bootstraps
-the sibling `--tab`s from inside that window, then becomes tab 1. Override the
-binary with `PORT_BROADCAST_TERMINAL` if needed.
+One regular Terminal window with N tabs (never N windows).
 
-**Ptyxis has no classic tab bar** (the `AdwTabBar` is hidden in stock UI). Switch
-tabs with the header **Show Open Tabs** grid button (or Ctrl-Shift-O if bound),
-not a strip of tab titles. A window with only one page has no tab UI at all —
-if you ever see a lonely stack hop in its own window, sibling `--tab`s landed on
-another Ptyxis window (often a restored session). The launcher briefly turns
-`org.gnome.Ptyxis restore-session` off during spawn so all N tabs stay together.
+**Multi-tab (N>1)** prefers **gnome-terminal** when installed — it shows a real
+tab bar. Ubuntu’s default **Ptyxis** hides its `AdwTabBar`, so a correct N-tab
+stack looks like a single terminal unless you open the header **Show Open Tabs**
+grid (easy to miss / report as “one window, no tabs”). Override with
+`PORT_BROADCAST_TERMINAL=ptyxis` if you want Ptyxis anyway.
+
+**Single-tab / `--smoke`** still prefers Ptyxis → kgx → gnome-terminal.
+
+Ptyxis fallback path (when forced): cannot combine `--new-window` and `--tab` in
+one argv; bootstrap opens sibling `--tab`s from inside the new window and briefly
+disables `org.gnome.Ptyxis restore-session` so tabs are not stolen by a restored
+session window.
 
 After a tab’s hop command exits, the hop itself drops to an interactive bash
 (`cmd; exec bash`) so the tab, scrollback, and TCP listen stay up (restart /
