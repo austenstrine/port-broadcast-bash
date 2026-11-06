@@ -100,13 +100,21 @@ die() {
 	exit 1
 }
 
-# Prefer Ubuntu’s default Terminal (Ptyxis), then kgx, then gnome-terminal.
+# Terminal choice:
+#   - Explicit PORT_BROADCAST_TERMINAL always wins.
+#   - Multi-tab (N>1): prefer gnome-terminal — it has a real tab bar. Stock Ptyxis
+#     hides AdwTabBar, so a working N-tab window looks like "one window, no tabs"
+#     unless you open the overview grid (easy to miss).
+#   - Single-tab / smoke: prefer Ptyxis (Ubuntu “Terminal”), then kgx, then gnome-terminal.
 resolve_terminal() {
 	local cand resolved=""
 	if [[ -n "${PORT_BROADCAST_TERMINAL:-}" ]]; then
 		cand="${PORT_BROADCAST_TERMINAL}"
 		command -v "$cand" >/dev/null 2>&1 || die "PORT_BROADCAST_TERMINAL not found: $cand"
 		TERM_BIN="$(command -v "$cand")"
+	elif ((TABS > 1)) && command -v gnome-terminal >/dev/null 2>&1; then
+		TERM_BIN="$(command -v gnome-terminal)"
+		echo "port-broadcast-launcher: multi-tab → gnome-terminal (visible tab bar; Ptyxis hides its tab strip)" >&2
 	else
 		for cand in ptyxis kgx gnome-terminal; do
 			if command -v "$cand" >/dev/null 2>&1; then
