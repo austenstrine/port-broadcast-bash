@@ -51,18 +51,13 @@ Override bind/port with `-b` / `-p` or `PORT_BROADCAST_BIND` / `PORT_BROADCAST_P
 
 One regular Terminal window with N tabs (never N windows).
 
-**Multi-tab (N>1)** prefers **gnome-terminal** when installed — it shows a real
-tab bar. Ubuntu’s default **Ptyxis** hides its `AdwTabBar`, so a correct N-tab
-stack looks like a single terminal unless you open the header **Show Open Tabs**
-grid (easy to miss / report as “one window, no tabs”). Override with
-`PORT_BROADCAST_TERMINAL=ptyxis` if you want Ptyxis anyway.
+Prefer **Ptyxis** (Ubuntu “Terminal”) → kgx → gnome-terminal. Override with
+`PORT_BROADCAST_TERMINAL`.
 
-**Single-tab / `--smoke`** still prefers Ptyxis → kgx → gnome-terminal.
-
-Ptyxis fallback path (when forced): cannot combine `--new-window` and `--tab` in
-one argv; bootstrap opens sibling `--tab`s from inside the new window and briefly
-disables `org.gnome.Ptyxis restore-session` so tabs are not stolen by a restored
-session window.
+**Ptyxis:** every hop is `ptyxis --tab -x …` (no `--new-window`). Ubuntu’s Ptyxis
+treats `--new-window -x` as single-terminal mode (no tab chrome). Plain `--tab -x`
+keeps a normal tab bar: it creates a window if none exists, otherwise joins the
+MRU Terminal window.
 
 After a tab’s hop command exits, the hop itself drops to an interactive bash
 (`cmd; exec bash`) so the tab, scrollback, and TCP listen stay up (restart /
