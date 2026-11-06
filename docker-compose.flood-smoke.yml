@@ -1,0 +1,33 @@
+# Limited flood-smoke harness. 100% CPU inside == one virtual CPU on the host.
+# Kill anytime:  docker kill port-broadcast-flood-smoke
+#
+# Prefer the wrapper (builds + enforces container-only):
+#   ./bin/flood-smoke-container drop
+#   ./bin/flood-smoke-container attach
+#   ./bin/flood-smoke-container stress   # then: docker kill port-broadcast-flood-smoke
+
+name: port-broadcast-flood
+
+services:
+  flood-smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: port-broadcast-flood-smoke:local
+    container_name: port-broadcast-flood-smoke
+    # One virtual CPU — a tight flood pegs the container, not the host.
+    cpus: 1.0
+    cpu_shares: 256
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    # No host ports — hop + nc + flood all stay inside the cgroup.
+    network_mode: bridge
+    volumes:
+      - ./:/src:ro
+    working_dir: /src
+    environment:
+      PORT_BROADCAST_BIND: "127.0.0.1"
+      PORT_BROADCAST_PORT: "4591"
+      FLOOD_IN_CONTAINER: "1"
+    command: ["drop"]

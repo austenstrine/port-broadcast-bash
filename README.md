@@ -13,10 +13,14 @@ Clones a live shell session two ways:
 ## Layout
 
 ```
-bin/port-broadcast-shell      # PTY → TCP hop (canonical)
-bin/port-broadcast-launcher   # ONE gnome-terminal window, N tabs + flags
-scripts/                      # thin wrappers → bin/
-.vscode/tasks.json            # optional Cursor tasks (not the primary UI)
+bin/port-broadcast-shell         # PTY → TCP hop (canonical)
+bin/port-broadcast-launcher      # ONE gnome-terminal window, N tabs + flags
+bin/flood-smoke-container        # limited Docker flood smoke (only safe flood path)
+scripts/                         # thin wrappers → bin/
+scripts/flood-smoke-inner        # flood modes run *inside* the container
+Dockerfile                       # flood-smoke image (bash + script + nc)
+docker-compose.flood-smoke.yml   # 1 CPU / 256MiB / 64 pids
+.vscode/tasks.json               # optional Cursor tasks (not the primary UI)
 ```
 
 ## Requirements
@@ -79,19 +83,43 @@ Agent attach: `nc 127.0.0.1 4591` … (printed port map).
 
 Defaults: bind `127.0.0.1`, base port `4591`, tabs `6` (cap `16`, override with `PORT_BROADCAST_MAX_TABS`).
 
-## Noisy sessions / nc flood
+## Noisy sessions / flood smoke (container only)
+
+**Never run a bare-metal flood on the host.** A hung flood previously pegged ~100% host CPU and survived `timeout`. All flood smokes go through a hard-limited Docker cgroup that `docker kill` can stop.
+
+Limits (compose + wrapper): **1.0 CPU**, **256MiB RAM** (no extra swap), **64 pids**. Container name: `port-broadcast-flood-smoke`.
+
+```bash
+cd ~/Development/port-broadcast-bash
+
+# Bounded flood, no nc — PTY must not stall (default)
+./bin/flood-smoke-container drop
+
+# Bounded flood with nc attached (full-fidelity clone path)
+./bin/flood-smoke-container attach
+
+# Unbounded flood for kill drills (pegs the *container* CPU only)
+./bin/flood-smoke-container stress
+# emergency stop:
+docker kill port-broadcast-flood-smoke
+
+# One-shot: start stress → wait 3s → kill
+./bin/flood-smoke-container kill-demo
+```
+
+Compose equivalent:
+
+```bash
+docker compose -f docker-compose.flood-smoke.yml build
+docker compose -f docker-compose.flood-smoke.yml run --rm --name port-broadcast-flood-smoke flood-smoke drop
+docker kill port-broadcast-flood-smoke   # if a stress run is still up
+```
+
+Hop behavior (inside or out):
 
 - No on-disk typescript: `script` writes to a process sink (pipes/sockets; small tmpfs bounce only).
 - The clone sink **never stalls the PTY**. If nobody is attached (or the client is slow), surplus clone bytes are **dropped**.
-- For a full-fidelity flood, attach `nc` first, then generate load:
-
-```bash
-# terminal A
-./bin/port-broadcast-shell -p 4591 -- bash -c 'while true; do date; done'
-
-# terminal B (attach promptly)
-nc 127.0.0.1 4591
-```
+- Light interactive attach (not a flood) may still use host `nc` against a manually started hop — floods stay in the container.
 
 ## Optional Cursor tasks
 
@@ -104,6 +132,8 @@ nc 127.0.0.1 4591
 - Late joiners see live output only
 - Stream includes terminal control sequences
 - Do not automate multi-window GNOME spawns; use this launcher’s one-window path + `--confirm`
+- GUI still requires `--confirm` (1-tab `--smoke` included). Prefer `--dry-run` and container flood over host GUI when unsure.
+- Flood tests: **container only** (`./bin/flood-smoke-container`); never bare-metal urandom/base64 floods on the host
 
 ## Portfolio checkout
 
