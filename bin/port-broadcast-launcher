@@ -461,22 +461,41 @@ EOF
 	TITLES+=("$title")
 done
 
-# Build per-emulator launch argv lists. Ptyxis cannot combine --new-window and
-# --tab in one argv, so it is: one --new-window, then N-1 --tab into the MRU window.
+# Build per-emulator launch argv lists.
+#
+# Ptyxis/kgx cannot combine --new-window and --tab in one argv. External
+# `ptyxis --tab` lands on the *active* window, which races with other Terminal
+# windows and often leaves only tab 1 visible in the new window. Fix: open the
+# window with a bootstrap that runs *inside* that window (so it is active),
+# asks Ptyxis/kgx for sibling --tab runners, then execs tab 1's hop.
 declare -a LAUNCH_STEPS=()
 case "$TERM_KIND" in
-	ptyxis)
-		# -x takes a single command string (preferred over bare -- for a runner path).
-		LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"-T"$'\t'"${TITLES[0]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[0]}")
-		for ((i = 1; i < TABS; i++)); do
-			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"-T"$'\t'"${TITLES[$i]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[$i]}")
-		done
-		;;
-	kgx)
-		LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"--title=${TITLES[0]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"${RUNNERS[0]}")
-		for ((i = 1; i < TABS; i++)); do
-			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"--title=${TITLES[$i]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"${RUNNERS[$i]}")
-		done
+	ptyxis|kgx)
+		BOOT="$STATE_DIR/bootstrap"
+		{
+			printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+			printf 'TERM_BIN=%q\n' "$TERM_BIN"
+			printf 'ROOT=%q\n' "$ROOT"
+			printf 'echo "port-broadcast-launcher: opening %s sibling tab(s) from active window…" >&2\n' "$((TABS - 1))"
+			for ((i = 1; i < TABS; i++)); do
+				if [[ "$TERM_KIND" == ptyxis ]]; then
+					printf '%s\n' \
+						"\"\$TERM_BIN\" --tab -T $(printf '%q' "${TITLES[$i]}") -d \"\$ROOT\" -x $(printf '%q' "${RUNNERS[$i]}")" \
+						'sleep 0.15'
+				else
+					printf '%s\n' \
+						"\"\$TERM_BIN\" --tab --title=$(printf '%q' "${TITLES[$i]}") --working-directory=\"\$ROOT\" -- $(printf '%q' "${RUNNERS[$i]}")" \
+						'sleep 0.15'
+				fi
+			done
+			printf 'exec %q\n' "${RUNNERS[0]}"
+		} >"$BOOT"
+		chmod +x "$BOOT"
+		if [[ "$TERM_KIND" == ptyxis ]]; then
+			LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"-T"$'\t'"${TITLES[0]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"$BOOT")
+		else
+			LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"--title=${TITLES[0]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"$BOOT")
+		fi
 		;;
 	gnome-terminal)
 		# Single process: --command per tab (a bare -- would swallow later --tab args).
@@ -488,7 +507,6 @@ case "$TERM_KIND" in
 				gt_args+=(--tab --title="${TITLES[$i]}" --working-directory="$ROOT" --command "${RUNNERS[$i]}")
 			fi
 		done
-		# Encode as one step with SOH-separated argv (rare in paths).
 		LAUNCH_STEPS+=("all"$'\t'"$(printf '%s\t' "${gt_args[@]}")")
 		;;
 	*)
@@ -506,6 +524,10 @@ if ((DRY_RUN)); then
 		printf '%q ' "${parts[@]:1}" >&2
 		echo >&2
 	done
+	if [[ -f "${BOOT:-}" ]]; then
+		echo "dry-run bootstrap ($BOOT):" >&2
+		sed 's/^/  /' "$BOOT" >&2
+	fi
 	rm -rf "$STATE_DIR"
 	exit 0
 fi
@@ -521,13 +543,8 @@ run_step() {
 
 case "$TERM_KIND" in
 	ptyxis|kgx)
-		# First creates the window; following --tab attach to that MRU window.
+		# Bootstrap (inside the new window) opens sibling tabs, then becomes tab 1.
 		run_step "${LAUNCH_STEPS[0]}" &
-		# Brief settle so the new window is MRU before tabs land.
-		sleep 0.5
-		for ((i = 1; i < ${#LAUNCH_STEPS[@]}; i++)); do
-			run_step "${LAUNCH_STEPS[$i]}"
-		done
 		;;
 	gnome-terminal)
 		run_step "${LAUNCH_STEPS[0]}"
