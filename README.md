@@ -59,7 +59,10 @@ binary with `PORT_BROADCAST_TERMINAL` if needed.
 
 **Ptyxis has no classic tab bar** (the `AdwTabBar` is hidden in stock UI). Switch
 tabs with the header **Show Open Tabs** grid button (or Ctrl-Shift-O if bound),
-not a strip of tab titles.
+not a strip of tab titles. A window with only one page has no tab UI at all —
+if you ever see a lonely stack hop in its own window, sibling `--tab`s landed on
+another Ptyxis window (often a restored session). The launcher briefly turns
+`org.gnome.Ptyxis restore-session` off during spawn so all N tabs stay together.
 
 After a tab’s hop command exits, the hop itself drops to an interactive bash
 (`cmd; exec bash`) so the tab, scrollback, and TCP listen stay up (restart /
