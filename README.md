@@ -51,9 +51,15 @@ Override bind/port with `-b` / `-p` or `PORT_BROADCAST_BIND` / `PORT_BROADCAST_P
 
 One regular Terminal window with N tabs (never N windows). On current Ubuntu the
 default app is **Ptyxis** (`.desktop` name “Terminal”, also `x-terminal-emulator`).
-Ptyxis cannot combine `--new-window` and `--tab` in one argv, so the launcher
-opens the window once, then adds tabs into that MRU window. Override the binary
-with `PORT_BROADCAST_TERMINAL` if needed.
+Ptyxis cannot combine `--new-window` and `--tab` in one argv, and external
+`ptyxis --tab` follows the *active* window (easy to miss when other Terminal
+windows exist). The launcher opens one window whose first command bootstraps
+the sibling `--tab`s from inside that window, then becomes tab 1. Override the
+binary with `PORT_BROADCAST_TERMINAL` if needed.
+
+**Ptyxis has no classic tab bar** (the `AdwTabBar` is hidden in stock UI). Switch
+tabs with the header **Show Open Tabs** grid button (or Ctrl-Shift-O if bound),
+not a strip of tab titles.
 
 After a tab’s hop command exits, the hop itself drops to an interactive bash
 (`cmd; exec bash`) so the tab, scrollback, and TCP listen stay up (restart /
