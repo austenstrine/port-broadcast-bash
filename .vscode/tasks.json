@@ -3,7 +3,7 @@
 	"tasks": [
 		{
 			"label": "port-broadcast: 6 tabs",
-			"detail": "One Cursor window, six integrated terminal tabs (ports 4591–4596)",
+			"detail": "Optional Cursor fallback — prefer bin/port-broadcast-launcher (Linux terminal tabs)",
 			"dependsOrder": "parallel",
 			"dependsOn": [
 				"port-broadcast: tab 4591",
@@ -17,9 +17,9 @@
 		},
 		{
 			"label": "port-broadcast: smoke",
-			"detail": "1-tab short-lived smoke on 4591 (Cursor integrated terminal)",
+			"detail": "Optional Cursor fallback 1-tab smoke — prefer launcher --dry-run / shell hop",
 			"type": "shell",
-			"command": "echo '[port-broadcast] ready'; \"${workspaceFolder}/bin/port-broadcast-shell\" -p 4591 -- bash -c \"echo SMOKE_OK; tty; sleep 45\"",
+			"command": "echo '[port-broadcast] ready'; \"${workspaceFolder}/bin/port-broadcast-shell\" -p 4591 -- bash -c \"echo SMOKE_OK; tty; sleep 8\"",
 			"isBackground": true,
 			"options": {
 				"cwd": "${workspaceFolder}",
