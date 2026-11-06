@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Convenience wrapper — canonical entry is ../bin/flood-smoke-container
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/flood-smoke-container" "$@"
