@@ -8,13 +8,13 @@ Clones a live shell session two ways:
 2. **TCP listen port** — same bytes for an agent/client (`nc` / `socat`)
 
 **Stack:** bash + `script` + `tee` + `nc` only. No Python. No on-disk session typescript.
-**UI:** one regular Linux terminal window with N tabs (gnome-terminal) — **not** Cursor’s integrated terminal.
+**UI:** one regular Linux Terminal window with N tabs (Ubuntu default: **Ptyxis**, desktop name “Terminal”) — **not** Cursor’s integrated terminal, and not a hard-wired `gnome-terminal` path.
 
 ## Layout
 
 ```
 bin/port-broadcast-shell         # PTY → TCP hop (canonical)
-bin/port-broadcast-launcher      # ONE gnome-terminal window, N tabs + flags
+bin/port-broadcast-launcher      # ONE Terminal window, N tabs + flags
 bin/flood-smoke-container        # limited Docker flood smoke (only safe flood path)
 scripts/                         # thin wrappers → bin/
 scripts/flood-smoke-inner        # flood modes run *inside* the container
@@ -28,7 +28,7 @@ docker-compose.flood-smoke.yml   # 1 CPU / 256MiB / 64 pids
 - `bash`
 - `script(1)` (`bsdutils` / `util-linux`)
 - `nc` (OpenBSD netcat: `netcat-openbsd`)
-- `gnome-terminal` (launcher only; hop works without it)
+- Terminal emulator for the launcher (prefer `ptyxis`, then `kgx`, then `gnome-terminal`; override with `PORT_BROADCAST_TERMINAL`). Hop works without a GUI terminal.
 
 ## Quick start (hop)
 
@@ -47,9 +47,17 @@ nc 127.0.0.1 4591
 
 Override bind/port with `-b` / `-p` or `PORT_BROADCAST_BIND` / `PORT_BROADCAST_PORT`.
 
-## Multi-tab (Linux terminal window)
+## Multi-tab (Linux Terminal window)
 
-One `gnome-terminal` process: `--window` + N `--tab` (never N windows).
+One regular Terminal window with N tabs (never N windows). On current Ubuntu the
+default app is **Ptyxis** (`.desktop` name “Terminal”, also `x-terminal-emulator`).
+Ptyxis cannot combine `--new-window` and `--tab` in one argv, so the launcher
+opens the window once, then adds tabs into that MRU window. Override the binary
+with `PORT_BROADCAST_TERMINAL` if needed.
+
+After a tab’s hop command exits, the hop itself drops to an interactive bash
+(`cmd; exec bash`) so the tab, scrollback, and TCP listen stay up (restart /
+one-shot commands no longer close the tab).
 
 ```bash
 # Agent-safe: print argv + port map only (no GUI)
@@ -131,9 +139,10 @@ Hop behavior (inside or out):
 - One TCP listener at a time per port (v1)
 - Late joiners see live output only
 - Stream includes terminal control sequences
-- Do not automate multi-window GNOME spawns; use this launcher’s one-window path + `--confirm`
+- Do not automate multi-window terminal spawns; use this launcher’s one-window path + `--confirm`
 - GUI still requires `--confirm` (1-tab `--smoke` included). Prefer `--dry-run` and container flood over host GUI when unsure.
 - Flood tests: **container only** (`./bin/flood-smoke-container`); never bare-metal urandom/base64 floods on the host
+- Launcher prefers Ptyxis (Ubuntu “Terminal”); set `PORT_BROADCAST_TERMINAL` only if you intentionally want another emulator
 
 ## Portfolio checkout
 

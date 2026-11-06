@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # port-broadcast-launcher — one Linux terminal window, N tabs of port-broadcast-shell
 #
-# Opens ONE gnome-terminal window with N tabs. Each tab runs port-broadcast-shell
-# on a distinct listen port. Austen watches the window; agents attach with nc.
+# Opens ONE regular Terminal window (Ubuntu default: Ptyxis; desktop name "Terminal")
+# with N tabs. Each tab runs port-broadcast-shell on a distinct listen port.
+# Austen watches the window; agents attach with nc.
 #
-# Not Cursor's integrated terminal — a regular Linux terminal (tabs in one window).
+# Not Cursor's integrated terminal — and not a hard-wired gnome-terminal path.
+# Prefer: ptyxis (system default / x-terminal-emulator on Ubuntu) → kgx → gnome-terminal.
 #
 # Safety (machine previously hard-crashed on reckless multi-spawn / GUI smoke):
-#   - ONE gnome-terminal process (one --window + N --tab), never N windows
+#   - ONE terminal window with N tabs (never N windows)
 #   - Hard cap on tab count
-#   - Preflight: DISPLAY/dbus/gnome-terminal/script/nc/ports
+#   - Preflight: DISPLAY/dbus/terminal/script/nc/ports
 #   - Any real GUI launch requires --confirm (use --dry-run first)
-#   - --dry-run prints argv + port map only (agent-safe; no GUI)
+#   - --dry-run prints launch argv + port map only (agent-safe; no GUI)
+#   - Tabs keep a trailing interactive shell after the hop exits (scrollback stays)
 #
 # Usage:
 #   ./bin/port-broadcast-launcher --dry-run --smoke
@@ -38,6 +41,9 @@ PORTS_EXPLICIT=0
 TABS_EXPLICIT=0
 CONFIG_FILE=""
 DEFAULT_CMD=()
+# Resolved terminal binary + kind (ptyxis|kgx|gnome-terminal)
+TERM_BIN=""
+TERM_KIND=""
 # Per-tab command overrides keyed by 1-based index (sparse). Empty string = interactive.
 declare -A TAB_CMD=()
 declare -a PORT_LIST=()
@@ -46,8 +52,11 @@ usage() {
 	cat <<'EOF'
 Usage: port-broadcast-launcher [options] [-- command [args...]]
 
-  Open ONE Linux terminal window (gnome-terminal) with N tabs. Each tab runs
-  bin/port-broadcast-shell on a distinct port. Empty tab command = interactive shell.
+  Open ONE regular Linux Terminal window (Ptyxis / Ubuntu “Terminal” by default)
+  with N tabs. Each tab runs bin/port-broadcast-shell on a distinct port.
+  Empty tab command = interactive shell. After a tab command exits, the tab
+  keeps an interactive bash inside the hop so the tab, scrollback, and TCP
+  listen stay up.
   Not Cursor's integrated terminal.
 
 Options:
@@ -60,7 +69,7 @@ Options:
   -c, --config FILE         Load tabs/ports/cmds from a config file (see README)
       --confirm, -y         Required for any real GUI launch (prevents accidental spawn)
       --smoke               1-tab short-lived smoke; implies --tabs 1
-      --dry-run             Print gnome-terminal argv + port map; do not launch (agent-safe)
+      --dry-run             Print terminal argv + port map; do not launch (agent-safe)
   -h, --help                Show this help
 
   -- command ...            Same as --cmd: default command for tabs without --tab-cmd
@@ -91,8 +100,56 @@ die() {
 	exit 1
 }
 
-# Internal worker: gnome-terminal -e invokes a tiny runner that calls this.
-# Avoids nested-quote hell through -e (one executable path only).
+# Prefer Ubuntu’s default Terminal (Ptyxis), then kgx, then gnome-terminal.
+resolve_terminal() {
+	local cand resolved=""
+	if [[ -n "${PORT_BROADCAST_TERMINAL:-}" ]]; then
+		cand="${PORT_BROADCAST_TERMINAL}"
+		command -v "$cand" >/dev/null 2>&1 || die "PORT_BROADCAST_TERMINAL not found: $cand"
+		TERM_BIN="$(command -v "$cand")"
+	else
+		for cand in ptyxis kgx gnome-terminal; do
+			if command -v "$cand" >/dev/null 2>&1; then
+				TERM_BIN="$(command -v "$cand")"
+				break
+			fi
+		done
+		# Last resort: Debian/Ubuntu alternatives (often ptyxis on current Ubuntu)
+		if [[ -z "$TERM_BIN" ]] && command -v x-terminal-emulator >/dev/null 2>&1; then
+			TERM_BIN="$(command -v x-terminal-emulator)"
+		fi
+		[[ -n "$TERM_BIN" ]] || die "no terminal found (need ptyxis, kgx, or gnome-terminal)"
+	fi
+	resolved="$(basename "$(readlink -f "$TERM_BIN" 2>/dev/null || echo "$TERM_BIN")")"
+	case "$resolved" in
+		ptyxis|org.gnome.Ptyxis*)
+			TERM_KIND=ptyxis
+			;;
+		kgx|gnome-console*)
+			TERM_KIND=kgx
+			;;
+		gnome-terminal|gnome-terminal.real|gnome-terminal.wrapper)
+			TERM_KIND=gnome-terminal
+			;;
+		*)
+			# x-terminal-emulator → follow target name already; unknown wrapper → probe --help
+			if "$TERM_BIN" --help 2>&1 | grep -q -- '--new-window'; then
+				TERM_KIND=ptyxis
+			elif "$TERM_BIN" --help 2>&1 | grep -q -- '--tab'; then
+				TERM_KIND=gnome-terminal
+			else
+				die "unsupported terminal binary: $TERM_BIN (set PORT_BROADCAST_TERMINAL=ptyxis)"
+			fi
+			;;
+	esac
+}
+
+# Internal worker: the terminal invokes a tiny runner that calls this.
+# Avoids nested-quote hell (one executable path only).
+#
+# One-shot / restart tab commands are wrapped with a trailing interactive shell
+# *inside* the hop (`cmd; exec bash`) so the tab, scrollback, and TCP listen
+# stay up after the command finishes — previously those tabs vanished.
 exec_tab() {
 	local state_dir="" port="" bind="$BIND" index=""
 	while [[ $# -gt 0 ]]; do
@@ -130,7 +187,10 @@ exec_tab() {
 		extra=("${PORT_BROADCAST_TAB_CMD[@]}")
 	fi
 	if ((${#extra[@]})); then
-		exec "$SHELL_HELPER" -b "$bind" -p "$port" -- "${extra[@]}"
+		local run_line
+		run_line="$(printf '%q ' "${extra[@]}")"
+		exec "$SHELL_HELPER" -b "$bind" -p "$port" -- bash -c \
+			"${run_line}"$'\n'"printf 'port-broadcast: command finished (port %s); keeping hop open\\n' $(printf '%q' "$port") >&2"$'\n'"exec \"\${SHELL:-bash}\" -i"
 	fi
 	exec "$SHELL_HELPER" -b "$bind" -p "$port"
 }
@@ -336,9 +396,10 @@ fi
 [[ -x "$SHELL_HELPER" ]] || die "missing executable: $SHELL_HELPER"
 [[ -x "$SELF" ]] || die "launcher not executable: $SELF"
 
+resolve_terminal
+
 if ((DRY_RUN == 0)); then
 	[[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || die "no DISPLAY/WAYLAND_DISPLAY (GUI session required)"
-	command -v gnome-terminal >/dev/null 2>&1 || die "gnome-terminal required"
 	command -v script >/dev/null 2>&1 || die "script(1) required"
 	command -v nc >/dev/null 2>&1 || die "nc required"
 	if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ]]; then
@@ -350,7 +411,7 @@ if ((DRY_RUN == 0)); then
 	fi
 fi
 
-echo "port-broadcast-launcher: Linux terminal window tabs=${TABS} bind=${BIND} ports=${FIRST_PORT}…${LAST_PORT}" >&2
+echo "port-broadcast-launcher: terminal=${TERM_KIND} (${TERM_BIN}) tabs=${TABS} bind=${BIND} ports=${FIRST_PORT}…${LAST_PORT}" >&2
 for ((i = 0; i < TABS; i++)); do
 	port="${PORT_LIST[$i]}"
 	idx=$((i + 1))
@@ -384,7 +445,8 @@ for ((i = 1; i <= TABS; i++)); do
 	fi
 done
 
-gt_args=(gnome-terminal --geometry=100x28 --role=port-broadcast-launcher)
+declare -a RUNNERS=()
+declare -a TITLES=()
 for ((i = 0; i < TABS; i++)); do
 	port="${PORT_LIST[$i]}"
 	idx=$((i + 1))
@@ -395,22 +457,81 @@ for ((i = 0; i < TABS; i++)); do
 exec $(printf '%q' "$SELF") --exec-tab --state $(printf '%q' "$STATE_DIR") -b $(printf '%q' "$BIND") -p $(printf '%q' "$port") -i $(printf '%q' "$idx")
 EOF
 	chmod +x "$runner"
-	if ((i == 0)); then
-		gt_args+=(--window --title="$title" --working-directory="$ROOT" -e "$runner")
-	else
-		gt_args+=(--tab --title="$title" --working-directory="$ROOT" -e "$runner")
-	fi
+	RUNNERS+=("$runner")
+	TITLES+=("$title")
 done
 
+# Build per-emulator launch argv lists. Ptyxis cannot combine --new-window and
+# --tab in one argv, so it is: one --new-window, then N-1 --tab into the MRU window.
+declare -a LAUNCH_STEPS=()
+case "$TERM_KIND" in
+	ptyxis)
+		# -x takes a single command string (preferred over bare -- for a runner path).
+		LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"-T"$'\t'"${TITLES[0]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[0]}")
+		for ((i = 1; i < TABS; i++)); do
+			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"-T"$'\t'"${TITLES[$i]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[$i]}")
+		done
+		;;
+	kgx)
+		LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"--title=${TITLES[0]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"${RUNNERS[0]}")
+		for ((i = 1; i < TABS; i++)); do
+			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"--title=${TITLES[$i]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"${RUNNERS[$i]}")
+		done
+		;;
+	gnome-terminal)
+		# Single process: --command per tab (a bare -- would swallow later --tab args).
+		declare -a gt_args=("$TERM_BIN" --geometry=100x28 --role=port-broadcast-launcher)
+		for ((i = 0; i < TABS; i++)); do
+			if ((i == 0)); then
+				gt_args+=(--window --title="${TITLES[$i]}" --working-directory="$ROOT" --command "${RUNNERS[$i]}")
+			else
+				gt_args+=(--tab --title="${TITLES[$i]}" --working-directory="$ROOT" --command "${RUNNERS[$i]}")
+			fi
+		done
+		# Encode as one step with SOH-separated argv (rare in paths).
+		LAUNCH_STEPS+=("all"$'\t'"$(printf '%s\t' "${gt_args[@]}")")
+		;;
+	*)
+		die "internal: unhandled TERM_KIND=$TERM_KIND"
+		;;
+esac
+
 if ((DRY_RUN)); then
-	echo "dry-run argv:" >&2
-	printf '  %q' "${gt_args[@]}" >&2
-	echo >&2
+	echo "dry-run launch (${#LAUNCH_STEPS[@]} step(s), kind=${TERM_KIND}):" >&2
+	for step in "${LAUNCH_STEPS[@]}"; do
+		# shellcheck disable=SC2206
+		IFS=$'\t' read -r -a parts <<<"$step"
+		printf '  ' >&2
+		# skip index field
+		printf '%q ' "${parts[@]:1}" >&2
+		echo >&2
+	done
 	rm -rf "$STATE_DIR"
 	exit 0
 fi
 
-echo "port-broadcast-launcher: launching one window (${TABS} tab(s))…" >&2
-"${gt_args[@]}"
+echo "port-broadcast-launcher: launching one ${TERM_KIND} window (${TABS} tab(s))…" >&2
+run_step() {
+	local step="$1"
+	local -a parts=()
+	IFS=$'\t' read -r -a parts <<<"$step"
+	# parts[0]=index; remainder=argv
+	"${parts[@]:1}"
+}
+
+case "$TERM_KIND" in
+	ptyxis|kgx)
+		# First creates the window; following --tab attach to that MRU window.
+		run_step "${LAUNCH_STEPS[0]}" &
+		# Brief settle so the new window is MRU before tabs land.
+		sleep 0.5
+		for ((i = 1; i < ${#LAUNCH_STEPS[@]}; i++)); do
+			run_step "${LAUNCH_STEPS[$i]}"
+		done
+		;;
+	gnome-terminal)
+		run_step "${LAUNCH_STEPS[0]}"
+		;;
+esac
 # Leave STATE_DIR for runners; cleaned up when window closes / reboot.
 exit 0
