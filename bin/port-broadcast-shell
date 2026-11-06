@@ -5,7 +5,9 @@
 #   1) this terminal — real PTY via script(1) (interactive; curses/TTY apps work)
 #   2) TCP listen port — same bytes, for an agent/client to attach with nc/socat
 #
-# Memory/pipes/sockets only (no session log file). Uses bash + script + nc.
+# Memory/pipes/sockets only (no on-disk session typescript). bash + script + tee + nc.
+# Noisy sessions: the clone sink never stalls the PTY — if no nc client is draining,
+# surplus clone bytes are dropped (attach nc for a full fidelity flood).
 #
 # Start (interactive shell):
 #   ./bin/port-broadcast-shell
@@ -20,10 +22,6 @@
 #   socat - TCP:127.0.0.1:4591
 #
 # Defaults: bind 127.0.0.1, port 4591.
-# Caveats: no auth; prefer localhost; one listener at a time (v1); late joiners
-# see live output only; stream includes terminal control sequences; if nobody
-# is attached and the pipe buffer fills, the session can stall — attach nc first
-# for noisy sessions.
 
 set -euo pipefail
 
@@ -36,7 +34,8 @@ usage() {
 Usage: port-broadcast-shell [-b bind] [-p port] [-- command [args...]]
 
   Interactive PTY in this terminal; clone session output to a TCP port.
-  No disk session log (pipes/sockets only). bash + script(1) + nc.
+  No on-disk session typescript (pipes/sockets + optional tmpfs bounce only).
+  bash + script(1) + tee + nc.
 
 Options:
   -b, --bind ADDR   Listen address (default: 127.0.0.1, or PORT_BROADCAST_BIND)
@@ -49,8 +48,12 @@ Listen (client):
   nc 127.0.0.1 4591
   socat - TCP:127.0.0.1:4591
 
+Noisy / flood:
+  Attach nc before heavy output for a full clone. Without a client the PTY
+  keeps running — clone bytes may be dropped so the session never stalls.
+
 Caveats: no authentication; prefer localhost bind; one listener (v1); late
-clients get live tail only; attach a listener before heavy output.
+clients get live tail only; stream includes terminal control sequences.
 EOF
 }
 
@@ -100,22 +103,53 @@ if ! command -v nc >/dev/null 2>&1; then
 	exit 1
 fi
 
+# Clone sink: always consume script's typescript fd so the PTY never blocks.
+# Forward to nc via a fifo using nonblocking writes; drop when no client drains.
+# Bounce buffer lives on tmpfs (/dev/shm) when available — not a session log file.
+clone_sink() {
+	local dir fifo ncpid
+	if [[ -d /dev/shm && -w /dev/shm ]]; then
+		dir=$(mktemp -d /dev/shm/port-broadcast.XXXXXX)
+	else
+		dir=$(mktemp -d /tmp/port-broadcast.XXXXXX)
+	fi
+	fifo="$dir/f"
+	mkfifo "$fifo"
+	# Hold RW open so writers never block on open(2); nc reads when a client connects.
+	exec 5<>"$fifo"
+	(
+		while true; do
+			nc -l -n -s "$BIND" -p "$PORT" <"$fifo" >/dev/null 2>&1 || true
+		done
+	) &
+	ncpid=$!
+	printf '%s\n' "$ncpid" >"$dir/ncpid"
+	cleanup() {
+		local pid=""
+		[[ -f "${dir:-}/ncpid" ]] && pid=$(cat "$dir/ncpid" 2>/dev/null || true)
+		[[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+		exec 5>&- 2>/dev/null || true
+		[[ -n "${dir:-}" ]] && rm -rf "$dir"
+	}
+	trap cleanup EXIT
+	set +e
+	set +o pipefail
+	while dd bs=65536 count=1 of="$dir/c" status=none 2>/dev/null; do
+		[[ -s "$dir/c" ]] || break
+		dd if="$dir/c" of="$fifo" bs=65536 oflag=nonblock status=none 2>/dev/null || true
+	done
+}
+
 echo "port-broadcast-shell: PTY here; clone on ${BIND}:${PORT} -- attach with: nc ${BIND} ${PORT}" >&2
 
-# Clone sink: script(1) keeps a real PTY on this terminal and writes a copy of
-# the session stream into the process substitution (no disk file). That copy
-# is fed to nc -l; agents connect as TCP clients. Do not exec — bash must own
-# the >(…) lifecycle or script never exits cleanly.
-#
-# OpenBSD nc: -l listen, -n numeric, -s bind addr. No -k so stdin EOF (session
-# end) tears the listen side down with the PTY.
-clone_sink=(nc -l -n -s "$BIND" -p "$PORT")
-
+# script FILE arg must be the typescript sink (process substitution).
+# Do NOT redirect script's stdout onto the sink — that leaves a default
+# on-disk ./typescript and does not feed nc.
 if ((${#CMD[@]})); then
 	cmd_str=$(printf '%q ' "${CMD[@]}")
-	script -q -f -e -c "$cmd_str" >("${clone_sink[@]}" >/dev/null)
+	script -q -f -e -c "$cmd_str" >(clone_sink)
 	exit $?
 fi
 
-script -q -f -e >("${clone_sink[@]}" >/dev/null)
+script -q -f -e >(clone_sink)
 exit $?

@@ -1,59 +1,88 @@
 #!/usr/bin/env bash
-# port-broadcast-launcher — N Cursor integrated-terminal tabs of port-broadcast-shell
+# port-broadcast-launcher — one Linux terminal window, N tabs of port-broadcast-shell
 #
-# Uses the terminal already inside Cursor (editor/panel tabs) — not a second OS
-# terminal app (GNOME Terminal / Wayland). Austen watches Cursor; agents nc ports.
+# Opens ONE gnome-terminal window with N tabs. Each tab runs port-broadcast-shell
+# on a distinct listen port. Austen watches the window; agents attach with nc.
 #
-# How tabs open:
-#   Cursor/VS Code tasks with presentation.panel=dedicated (see .vscode/tasks.json).
-#   This script validates ports, prints the nc map, and points at the task labels.
+# Not Cursor's integrated terminal — a regular Linux terminal (tabs in one window).
+#
+# Safety (machine previously hard-crashed on reckless multi-spawn / GUI smoke):
+#   - ONE gnome-terminal process (one --window + N --tab), never N windows
+#   - Hard cap on tab count
+#   - Preflight: DISPLAY/dbus/gnome-terminal/script/nc/ports
+#   - Any real GUI launch requires --confirm (use --dry-run first)
+#   - --dry-run prints argv + port map only (agent-safe; no GUI)
 #
 # Usage:
-#   ./bin/port-broadcast-launcher --smoke
+#   ./bin/port-broadcast-launcher --dry-run --smoke
+#   ./bin/port-broadcast-launcher --smoke --confirm          # 1-tab GUI (Austen OK)
 #   ./bin/port-broadcast-launcher --tabs 6 --confirm
-#   ./scripts/port-broadcast-launcher --smoke   # same via scripts/ wrapper
-#
-# Then in Cursor (open this repo): Command Palette → "Tasks: Run Task" → label.
-# Agent attach: nc 127.0.0.1 4591 … 4596
+#   ./bin/port-broadcast-launcher --tabs 3 --confirm --tab-cmd 2='npm run dev'
+#   ./bin/port-broadcast-launcher --ports 4591,4600,4700 --confirm
+#   ./bin/port-broadcast-launcher --config ./tabs.conf --confirm
+#   ./bin/port-broadcast-launcher --dry-run --tabs 6 --confirm -- dssh logs backend
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF="${ROOT}/bin/port-broadcast-launcher"
 SHELL_HELPER="${ROOT}/bin/port-broadcast-shell"
 BIND="${PORT_BROADCAST_BIND:-127.0.0.1}"
 BASE_PORT="${PORT_BROADCAST_BASE_PORT:-4591}"
 TABS="${PORT_BROADCAST_TABS:-6}"
-MAX_TABS=8
+MAX_TABS="${PORT_BROADCAST_MAX_TABS:-16}"
 CONFIRM=0
 DRY_RUN=0
 SMOKE=0
+PORTS_EXPLICIT=0
+TABS_EXPLICIT=0
+CONFIG_FILE=""
+DEFAULT_CMD=()
+# Per-tab command overrides keyed by 1-based index (sparse). Empty string = interactive.
+declare -A TAB_CMD=()
+declare -a PORT_LIST=()
 
 usage() {
 	cat <<'EOF'
-Usage: port-broadcast-launcher [options]
+Usage: port-broadcast-launcher [options] [-- command [args...]]
 
-  Prepare N port-broadcast tabs in Cursor's integrated terminal (not GNOME).
-  Prints the port map and the Tasks: Run Task label to open.
+  Open ONE Linux terminal window (gnome-terminal) with N tabs. Each tab runs
+  bin/port-broadcast-shell on a distinct port. Empty tab command = interactive shell.
+  Not Cursor's integrated terminal.
 
 Options:
-  -n, --tabs N          Tab count (default: 6, or PORT_BROADCAST_TABS; max 8)
-  -p, --base-port PORT  First listen port (default: 4591; tasks ship for 4591–4596)
-  -b, --bind ADDR       Listen address (default: 127.0.0.1, or PORT_BROADCAST_BIND)
-      --confirm         Required when tabs > 1
-      --smoke           Point at 1-tab smoke task (implies --tabs 1)
-      --dry-run         Print port map + task label only (same as default; no side effects)
-  -h, --help            Show this help
+  -n, --tabs N              Tab count (default: 6, or PORT_BROADCAST_TABS; max 16)
+  -p, --base-port PORT      First listen port (default: 4591); ports = base..base+N-1
+      --ports LIST          Comma-separated ports (sets tab count unless --tabs given)
+  -b, --bind ADDR           Listen address (default: 127.0.0.1, or PORT_BROADCAST_BIND)
+      --cmd CMD             Default command for every tab without --tab-cmd (shell -c)
+      --tab-cmd INDEX=CMD   Per-tab command (1-based; repeatable). Empty CMD = interactive
+  -c, --config FILE         Load tabs/ports/cmds from a config file (see README)
+      --confirm, -y         Required for any real GUI launch (prevents accidental spawn)
+      --smoke               1-tab short-lived smoke; implies --tabs 1
+      --dry-run             Print gnome-terminal argv + port map; do not launch (agent-safe)
+  -h, --help                Show this help
 
-Open tabs (in Cursor — the regular IDE terminal):
-  Command Palette → "Tasks: Run Task" → port-broadcast: smoke
-  Command Palette → "Tasks: Run Task" → port-broadcast: 6 tabs
+  -- command ...            Same as --cmd: default command for tabs without --tab-cmd
 
-Agent attach:
+Config file (KEY=VALUE, # comments):
+  tabs=3
+  base-port=4591
+  bind=127.0.0.1
+  ports=4591,4600,4700
+  cmd=echo default
+  tab.1=
+  tab.2=npm run dev
+
+Agent attach (after launch):
   nc 127.0.0.1 4591
   …
 
-Note: shipped tasks bind ports 4591–4596. --base-port only remaps the printed
-nc cheat-sheet; retarget tasks if you shift the range.
+Safe first steps:
+  ./bin/port-broadcast-launcher --dry-run --smoke
+  ./bin/port-broadcast-shell -p 4591 -- bash -c 'echo SMOKE_OK; sleep 2'
+  # GUI smoke only with Austen OK:
+  ./bin/port-broadcast-launcher --smoke --confirm
 EOF
 }
 
@@ -62,21 +91,164 @@ die() {
 	exit 1
 }
 
+# Internal worker: gnome-terminal -e invokes a tiny runner that calls this.
+# Avoids nested-quote hell through -e (one executable path only).
+exec_tab() {
+	local state_dir="" port="" bind="$BIND" index=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--state)
+				state_dir="${2:?}"
+				shift 2
+				;;
+			-p|--port)
+				port="${2:?}"
+				shift 2
+				;;
+			-b|--bind)
+				bind="${2:?}"
+				shift 2
+				;;
+			-i|--index)
+				index="${2:?}"
+				shift 2
+				;;
+			*)
+				die "exec-tab: unknown arg: $1"
+				;;
+		esac
+	done
+	[[ -n "$state_dir" && -n "$port" ]] || die "exec-tab requires --state DIR -p PORT"
+	local -a extra=()
+	local cmd_file="$state_dir/cmd"
+	if [[ -n "$index" && -f "$state_dir/cmd.$index" ]]; then
+		cmd_file="$state_dir/cmd.$index"
+	fi
+	if [[ -f "$cmd_file" && -s "$cmd_file" ]]; then
+		# shellcheck disable=SC1090
+		source "$cmd_file"
+		extra=("${PORT_BROADCAST_TAB_CMD[@]}")
+	fi
+	if ((${#extra[@]})); then
+		exec "$SHELL_HELPER" -b "$bind" -p "$port" -- "${extra[@]}"
+	fi
+	exec "$SHELL_HELPER" -b "$bind" -p "$port"
+}
+
+if [[ "${1:-}" == "--exec-tab" ]]; then
+	shift
+	exec_tab "$@"
+fi
+
+write_cmd_file() {
+	local path="$1"
+	shift
+	if (($#)); then
+		{
+			printf 'PORT_BROADCAST_TAB_CMD=('
+			printf ' %q' "$@"
+			printf ' )\n'
+		} >"$path"
+	else
+		: >"$path"
+	fi
+}
+
+load_config() {
+	local file="$1" line key val idx
+	[[ -f "$file" ]] || die "config not found: $file"
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line%%#*}"
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[[ -z "$line" ]] && continue
+		[[ "$line" == *=* ]] || die "config: expected KEY=VALUE (got: $line)"
+		key="${line%%=*}"
+		val="${line#*=}"
+		key="${key%"${key##*[![:space:]]}"}"
+		case "$key" in
+			tabs)
+				TABS="$val"
+				TABS_EXPLICIT=1
+				;;
+			base-port|base_port)
+				BASE_PORT="$val"
+				;;
+			bind)
+				BIND="$val"
+				;;
+			ports)
+				parse_ports_list "$val"
+				;;
+			cmd)
+				DEFAULT_CMD=(bash -c "$val")
+				;;
+			tab.*)
+				idx="${key#tab.}"
+				[[ "$idx" =~ ^[0-9]+$ ]] || die "config: bad tab key: $key"
+				TAB_CMD["$idx"]=$val
+				;;
+			*)
+				die "config: unknown key: $key"
+				;;
+		esac
+	done <"$file"
+}
+
+parse_ports_list() {
+	local raw="$1" p
+	local -a cleaned=()
+	PORTS_EXPLICIT=1
+	PORT_LIST=()
+	IFS=',' read -r -a PORT_LIST <<<"$raw"
+	for p in "${PORT_LIST[@]}"; do
+		p="${p#"${p%%[![:space:]]*}"}"
+		p="${p%"${p##*[![:space:]]}"}"
+		[[ "$p" =~ ^[0-9]+$ ]] || die "invalid port in --ports: $p"
+		((p >= 1 && p <= 65535)) || die "port out of range: $p"
+		cleaned+=("$p")
+	done
+	PORT_LIST=("${cleaned[@]}")
+	((${#PORT_LIST[@]} >= 1)) || die "--ports needs at least one port"
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		-n|--tabs)
 			TABS="${2:?missing tab count}"
+			TABS_EXPLICIT=1
 			shift 2
 			;;
 		-p|--base-port)
 			BASE_PORT="${2:?missing base port}"
 			shift 2
 			;;
+		--ports)
+			parse_ports_list "${2:?missing ports list}"
+			shift 2
+			;;
 		-b|--bind)
 			BIND="${2:?missing bind address}"
 			shift 2
 			;;
-		--confirm)
+		--cmd)
+			DEFAULT_CMD=(bash -c "${2:?missing command}")
+			shift 2
+			;;
+		--tab-cmd)
+			spec="${2:?missing INDEX=command}"
+			idx="${spec%%=*}"
+			rest="${spec#*=}"
+			[[ "$spec" == *=* ]] || die "--tab-cmd needs INDEX=command (got: $spec)"
+			[[ "$idx" =~ ^[0-9]+$ ]] || die "--tab-cmd index must be 1-based integer"
+			TAB_CMD["$idx"]=$rest
+			shift 2
+			;;
+		-c|--config)
+			CONFIG_FILE="${2:?missing config path}"
+			shift 2
+			;;
+		--confirm|-y)
 			CONFIRM=1
 			shift
 			;;
@@ -93,79 +265,152 @@ while [[ $# -gt 0 ]]; do
 			exit 0
 			;;
 		--)
-			die "per-tab -- command is not wired through Cursor tasks yet; edit .vscode/tasks.json or run port-broadcast-shell directly in a Cursor terminal"
+			shift
+			DEFAULT_CMD=("$@")
+			break
 			;;
 		-*)
 			die "unknown option: $1"
 			;;
 		*)
-			die "unexpected argument: $1"
+			die "unexpected argument: $1 (use -- before a command)"
 			;;
 	esac
 done
 
+if [[ -n "$CONFIG_FILE" ]]; then
+	load_config "$CONFIG_FILE"
+fi
+
 if ((SMOKE)); then
 	TABS=1
+	TABS_EXPLICIT=1
+	PORTS_EXPLICIT=0
+	PORT_LIST=()
+	if ((${#DEFAULT_CMD[@]} == 0)) && [[ -z "${TAB_CMD[1]+x}" ]]; then
+		DEFAULT_CMD=(bash -c 'echo "port-broadcast smoke: tab1 ok"; tty; echo SMOKE_OK; sleep 8')
+	fi
+fi
+
+if ((PORTS_EXPLICIT)); then
+	if ((TABS_EXPLICIT)) && ((TABS != ${#PORT_LIST[@]})); then
+		die "--tabs ${TABS} does not match --ports count ${#PORT_LIST[@]}"
+	fi
+	TABS="${#PORT_LIST[@]}"
 fi
 
 if ! [[ "$TABS" =~ ^[0-9]+$ ]] || ((TABS < 1 || TABS > MAX_TABS)); then
 	die "tabs must be 1..${MAX_TABS} (got: $TABS)"
 fi
 
-if ! [[ "$BASE_PORT" =~ ^[0-9]+$ ]] || ((BASE_PORT < 1 || BASE_PORT > 65535)); then
-	die "invalid base port: $BASE_PORT"
-fi
-
-LAST_PORT=$((BASE_PORT + TABS - 1))
-if ((LAST_PORT > 65535)); then
-	die "port range ${BASE_PORT}-${LAST_PORT} exceeds 65535"
-fi
-
-if ((TABS > 1 && CONFIRM == 0)); then
-	die "tabs=${TABS} requires --confirm (try --smoke / --tabs 1 first)"
-fi
-
-[[ -x "$SHELL_HELPER" ]] || die "missing executable: $SHELL_HELPER"
-command -v nc >/dev/null 2>&1 || die "nc required"
-command -v script >/dev/null 2>&1 || die "script(1) required"
-
-task_label=""
-if ((SMOKE)) || ((TABS == 1 && BASE_PORT == 4591)); then
-	task_label="port-broadcast: smoke"
-elif ((TABS == 6 && BASE_PORT == 4591)); then
-	task_label="port-broadcast: 6 tabs"
-else
-	task_label=""
-fi
-
-echo "port-broadcast-launcher: Cursor integrated terminal (not GNOME)" >&2
-echo "port-broadcast-launcher: tabs=${TABS} bind=${BIND} ports=${BASE_PORT}-${LAST_PORT}" >&2
-for ((i = 0; i < TABS; i++)); do
-	port=$((BASE_PORT + i))
-	echo "  tab $((i + 1)): nc ${BIND} ${port}" >&2
-	if ss -ltn "( sport = :$port )" 2>/dev/null | grep -q ":${port} "; then
-		die "port ${port} already in use"
+if ! ((PORTS_EXPLICIT)); then
+	if ! [[ "$BASE_PORT" =~ ^[0-9]+$ ]] || ((BASE_PORT < 1 || BASE_PORT > 65535)); then
+		die "invalid base port: $BASE_PORT"
 	fi
-done
-
-echo >&2
-if [[ -n "$task_label" ]]; then
-	echo "Open in Cursor (regular IDE terminal tabs):" >&2
-	echo "  Command Palette → Tasks: Run Task → ${task_label}" >&2
-else
-	echo "No shipped task for tabs=${TABS} base=${BASE_PORT}." >&2
-	echo "Open Cursor terminals manually and run:" >&2
-	for ((i = 0; i < TABS; i++)); do
-		port=$((BASE_PORT + i))
-		echo "  ${SHELL_HELPER} -b ${BIND} -p ${port}" >&2
+	PORT_LIST=()
+	local_i=0
+	for ((local_i = 0; local_i < TABS; local_i++)); do
+		PORT_LIST+=("$((BASE_PORT + local_i))")
 	done
 fi
 
-echo >&2
-echo "Why not GNOME Terminal: that is a second OS terminal app; Cursor already has tabs." >&2
+((${#PORT_LIST[@]} == TABS)) || die "internal: port list length ${#PORT_LIST[@]} != tabs $TABS"
 
-if ((DRY_RUN)); then
-	echo "dry-run: no task invoked." >&2
+for port in "${PORT_LIST[@]}"; do
+	[[ "$port" =~ ^[0-9]+$ ]] || die "invalid port: $port"
+	((port >= 1 && port <= 65535)) || die "port out of range: $port"
+done
+
+LAST_PORT="${PORT_LIST[$((TABS - 1))]}"
+FIRST_PORT="${PORT_LIST[0]}"
+
+for idx in "${!TAB_CMD[@]}"; do
+	((idx >= 1 && idx <= TABS)) || die "--tab-cmd index $idx out of range 1..$TABS"
+done
+
+# Real GUI launch always needs --confirm (incl. 1-tab / --smoke) after prior crashes.
+if ((DRY_RUN == 0 && CONFIRM == 0)); then
+	die "GUI launch requires --confirm (try --dry-run first; agents: hop-smoke with bin/port-broadcast-shell)"
 fi
 
+[[ -x "$SHELL_HELPER" ]] || die "missing executable: $SHELL_HELPER"
+[[ -x "$SELF" ]] || die "launcher not executable: $SELF"
+
+if ((DRY_RUN == 0)); then
+	[[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || die "no DISPLAY/WAYLAND_DISPLAY (GUI session required)"
+	command -v gnome-terminal >/dev/null 2>&1 || die "gnome-terminal required"
+	command -v script >/dev/null 2>&1 || die "script(1) required"
+	command -v nc >/dev/null 2>&1 || die "nc required"
+	if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ]]; then
+		export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus"
+	fi
+	[[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || die "DBUS_SESSION_BUS_ADDRESS unset (no session bus)"
+	if ! timeout 3 gdbus introspect --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus >/dev/null 2>&1; then
+		die "session dbus not reachable (refuse GUI launch)"
+	fi
+fi
+
+echo "port-broadcast-launcher: Linux terminal window tabs=${TABS} bind=${BIND} ports=${FIRST_PORT}…${LAST_PORT}" >&2
+for ((i = 0; i < TABS; i++)); do
+	port="${PORT_LIST[$i]}"
+	idx=$((i + 1))
+	cmd_note="interactive"
+	if [[ -n "${TAB_CMD[$idx]+x}" ]]; then
+		if [[ -z "${TAB_CMD[$idx]}" ]]; then
+			cmd_note="interactive"
+		else
+			cmd_note="cmd: ${TAB_CMD[$idx]}"
+		fi
+	elif ((${#DEFAULT_CMD[@]})); then
+		cmd_note="cmd: ${DEFAULT_CMD[*]}"
+	fi
+	echo "  tab ${idx}: nc ${BIND} ${port}  (${cmd_note})" >&2
+	if ((DRY_RUN == 0)); then
+		if ss -ltn "( sport = :$port )" 2>/dev/null | grep -q ":${port} "; then
+			die "port ${port} already in use"
+		fi
+	fi
+done
+
+STATE_DIR="$(mktemp -d /tmp/port-broadcast-launcher.XXXXXX)"
+write_cmd_file "$STATE_DIR/cmd" "${DEFAULT_CMD[@]+"${DEFAULT_CMD[@]}"}"
+for ((i = 1; i <= TABS; i++)); do
+	if [[ -n "${TAB_CMD[$i]+x}" ]]; then
+		if [[ -z "${TAB_CMD[$i]}" ]]; then
+			write_cmd_file "$STATE_DIR/cmd.$i"
+		else
+			write_cmd_file "$STATE_DIR/cmd.$i" bash -c "${TAB_CMD[$i]}"
+		fi
+	fi
+done
+
+gt_args=(gnome-terminal --geometry=100x28 --role=port-broadcast-launcher)
+for ((i = 0; i < TABS; i++)); do
+	port="${PORT_LIST[$i]}"
+	idx=$((i + 1))
+	title="pb:${port}"
+	runner="$STATE_DIR/run-${port}"
+	cat >"$runner" <<EOF
+#!/usr/bin/env bash
+exec $(printf '%q' "$SELF") --exec-tab --state $(printf '%q' "$STATE_DIR") -b $(printf '%q' "$BIND") -p $(printf '%q' "$port") -i $(printf '%q' "$idx")
+EOF
+	chmod +x "$runner"
+	if ((i == 0)); then
+		gt_args+=(--window --title="$title" --working-directory="$ROOT" -e "$runner")
+	else
+		gt_args+=(--tab --title="$title" --working-directory="$ROOT" -e "$runner")
+	fi
+done
+
+if ((DRY_RUN)); then
+	echo "dry-run argv:" >&2
+	printf '  %q' "${gt_args[@]}" >&2
+	echo >&2
+	rm -rf "$STATE_DIR"
+	exit 0
+fi
+
+echo "port-broadcast-launcher: launching one window (${TABS} tab(s))…" >&2
+"${gt_args[@]}"
+# Leave STATE_DIR for runners; cleaned up when window closes / reboot.
 exit 0
