@@ -102,19 +102,13 @@ die() {
 
 # Terminal choice:
 #   - Explicit PORT_BROADCAST_TERMINAL always wins.
-#   - Multi-tab (N>1): prefer gnome-terminal — it has a real tab bar. Stock Ptyxis
-#     hides AdwTabBar, so a working N-tab window looks like "one window, no tabs"
-#     unless you open the overview grid (easy to miss).
-#   - Single-tab / smoke: prefer Ptyxis (Ubuntu “Terminal”), then kgx, then gnome-terminal.
+#   - Else prefer Ptyxis (Ubuntu “Terminal”), then kgx, then gnome-terminal.
 resolve_terminal() {
 	local cand resolved=""
 	if [[ -n "${PORT_BROADCAST_TERMINAL:-}" ]]; then
 		cand="${PORT_BROADCAST_TERMINAL}"
 		command -v "$cand" >/dev/null 2>&1 || die "PORT_BROADCAST_TERMINAL not found: $cand"
 		TERM_BIN="$(command -v "$cand")"
-	elif ((TABS > 1)) && command -v gnome-terminal >/dev/null 2>&1; then
-		TERM_BIN="$(command -v gnome-terminal)"
-		echo "port-broadcast-launcher: multi-tab → gnome-terminal (visible tab bar; Ptyxis hides its tab strip)" >&2
 	else
 		for cand in ptyxis kgx gnome-terminal; do
 			if command -v "$cand" >/dev/null 2>&1; then
@@ -471,44 +465,37 @@ done
 
 # Build per-emulator launch argv lists.
 #
-# Ptyxis/kgx cannot combine --new-window and --tab in one argv. External
-# `ptyxis --tab` follows the *MRU* window. With restore-session=true, Ptyxis
-# often raises the previous session as MRU, so sibling --tabs land there and
-# the new window keeps only tab 1 (no tab UI with a single page). Fix:
-#   1) briefly disable org.gnome.Ptyxis restore-session for the launch
-#   2) bootstrap sibling --tabs from inside the new window after a short settle
-#   3) exec tab 1's hop
+# Ubuntu Ptyxis (50.1-1ubuntu2) treats `--new-window -x` as single-terminal mode
+# (no tab chrome). Use only `--tab -x`: creates a normal window if none exists,
+# otherwise joins the MRU Terminal window (intentional).
+#
+# kgx still cannot combine --new-window and --tab in one argv; bootstrap opens
+# sibling --tabs from inside a new window, then execs tab 1's hop.
 declare -a LAUNCH_STEPS=()
-PTYXIS_RESTORE_PREV=""
+BOOT=""
 case "$TERM_KIND" in
-	ptyxis|kgx)
+	ptyxis)
+		for ((i = 0; i < TABS; i++)); do
+			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"-T"$'\t'"${TITLES[$i]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[$i]}")
+		done
+		;;
+	kgx)
 		BOOT="$STATE_DIR/bootstrap"
 		{
 			printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
 			printf 'TERM_BIN=%q\n' "$TERM_BIN"
 			printf 'ROOT=%q\n' "$ROOT"
-			# Let this window become MRU before any --tab (restore-session already off).
 			printf '%s\n' 'sleep 0.6'
 			printf 'echo "port-broadcast-launcher: opening %s sibling tab(s) into this window…" >&2\n' "$((TABS - 1))"
 			for ((i = 1; i < TABS; i++)); do
-				if [[ "$TERM_KIND" == ptyxis ]]; then
-					printf '%s\n' \
-						"\"\$TERM_BIN\" --tab -T $(printf '%q' "${TITLES[$i]}") -d \"\$ROOT\" -x $(printf '%q' "${RUNNERS[$i]}")" \
-						'sleep 0.25'
-				else
-					printf '%s\n' \
-						"\"\$TERM_BIN\" --tab --title=$(printf '%q' "${TITLES[$i]}") --working-directory=\"\$ROOT\" -- $(printf '%q' "${RUNNERS[$i]}")" \
-						'sleep 0.25'
-				fi
+				printf '%s\n' \
+					"\"\$TERM_BIN\" --tab --title=$(printf '%q' "${TITLES[$i]}") --working-directory=\"\$ROOT\" -- $(printf '%q' "${RUNNERS[$i]}")" \
+					'sleep 0.25'
 			done
 			printf 'exec %q\n' "${RUNNERS[0]}"
 		} >"$BOOT"
 		chmod +x "$BOOT"
-		if [[ "$TERM_KIND" == ptyxis ]]; then
-			LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"-T"$'\t'"${TITLES[0]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"$BOOT")
-		else
-			LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"--title=${TITLES[0]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"$BOOT")
-		fi
+		LAUNCH_STEPS+=("0"$'\t'"$TERM_BIN"$'\t'"--new-window"$'\t'"--title=${TITLES[0]}"$'\t'"--working-directory=$ROOT"$'\t'"--"$'\t'"$BOOT")
 		;;
 	gnome-terminal)
 		# Single process: --command per tab (a bare -- would swallow later --tab args).
@@ -545,7 +532,7 @@ if ((DRY_RUN)); then
 	exit 0
 fi
 
-echo "port-broadcast-launcher: launching one ${TERM_KIND} window (${TABS} tab(s))…" >&2
+echo "port-broadcast-launcher: launching ${TERM_KIND} (${TABS} tab(s))…" >&2
 run_step() {
 	local step="$1"
 	local -a parts=()
@@ -554,30 +541,14 @@ run_step() {
 	"${parts[@]:1}"
 }
 
-restore_ptyxis_session_pref() {
-	if [[ -n "${PTYXIS_RESTORE_PREV}" ]] && command -v gsettings >/dev/null 2>&1; then
-		gsettings set org.gnome.Ptyxis restore-session "${PTYXIS_RESTORE_PREV}" >/dev/null 2>&1 || true
-		PTYXIS_RESTORE_PREV=""
-	fi
-}
-
 case "$TERM_KIND" in
 	ptyxis)
-		# Pin MRU to the new window: do not restore the previous Ptyxis session
-		# mid-launch (that window steals --tab and leaves tab 1 alone with no tab UI).
-		if command -v gsettings >/dev/null 2>&1; then
-			PTYXIS_RESTORE_PREV="$(gsettings get org.gnome.Ptyxis restore-session 2>/dev/null || true)"
-			if [[ -n "${PTYXIS_RESTORE_PREV}" ]]; then
-				gsettings set org.gnome.Ptyxis restore-session false >/dev/null 2>&1 || true
-				trap restore_ptyxis_session_pref EXIT
-				echo "port-broadcast-launcher: restore-session temporarily off (was ${PTYXIS_RESTORE_PREV})" >&2
-			fi
-		fi
-		run_step "${LAUNCH_STEPS[0]}" &
-		# Hold restore-session off until sibling --tabs have had time to land.
-		sleep $((1 + TABS / 2))
-		restore_ptyxis_session_pref
-		trap - EXIT
+		# Sequential --tab -x; first creates a window if needed, rest join MRU.
+		# Do not wait: the first ptyxis may become the long-lived primary instance.
+		for step in "${LAUNCH_STEPS[@]}"; do
+			run_step "$step" &
+			sleep 0.35
+		done
 		;;
 	kgx)
 		run_step "${LAUNCH_STEPS[0]}" &
