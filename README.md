@@ -74,10 +74,12 @@ one-shot commands no longer close the tab).
 
 # Ports / per-tab commands (any or none)
 ./bin/port-broadcast-launcher --ports 4591,4600,4700 --confirm
-./bin/port-broadcast-launcher --tabs 3 --confirm --tab-cmd 2='npm run dev' --tab-cmd 3=
-./bin/port-broadcast-launcher --tabs 2 --confirm --cmd 'dssh logs backend'
+./bin/port-broadcast-launcher --tabs 3 --confirm --tab-cmd 2='npm run dev' --tab-cmd 3= --tab-alias 2=dev
+./bin/port-broadcast-launcher --tabs 2 --confirm --cmd 'dssh logs backend' --tab-alias 1=backend --tab-alias 2=backend
 ./bin/port-broadcast-launcher --config ./tabs.conf --confirm
 ```
+
+Tab titles default to `pb:<port>` (port is only for `nc` attach). Pass `--tab-alias INDEX=name` (or config `alias.N=`) so the Terminal tab shows the human name (`rlog`, `backend`, …). The hop also re-applies that title so bash/VTE OSC cwd titles do not overwrite it.
 
 Config file (`KEY=VALUE`, `#` comments):
 
@@ -89,6 +91,8 @@ bind=127.0.0.1
 cmd=echo default
 tab.1=
 tab.2=npm run dev
+alias.1=rlog
+alias.2=dev
 ```
 
 Agent attach: `nc 127.0.0.1 4591` … (printed port map).
