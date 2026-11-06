@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Host-side wrapper: flood smoke MUST run in a hard-limited container.
+# Never runs a bare-metal flood (last crash: hung flood ~100% host CPU).
+#
+#   ./bin/flood-smoke-container drop
+#   ./bin/flood-smoke-container attach
+#   ./bin/flood-smoke-container stress          # then docker kill …
+#   ./bin/flood-smoke-container kill
+#   ./bin/flood-smoke-container kill-demo       # start stress + kill after 3s
+#
+# Limits: 1 CPU, 256MiB RAM, 64 pids. Name: port-broadcast-flood-smoke
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${FLOOD_SMOKE_IMAGE:-port-broadcast-flood-smoke:local}"
+NAME="${FLOOD_SMOKE_NAME:-port-broadcast-flood-smoke}"
+CPUS="${FLOOD_SMOKE_CPUS:-1.0}"
+MEMORY="${FLOOD_SMOKE_MEMORY:-256m}"
+PIDS="${FLOOD_SMOKE_PIDS:-64}"
+MODE="${1:-drop}"
+
+die() { echo "flood-smoke-container: $*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+Usage: flood-smoke-container <drop|attach|stress|kill|kill-demo|build|help>
+
+  drop       Bounded flood, no nc (default) — container only
+  attach     Bounded flood with nc attached — container only
+  stress     Unbounded flood until killed — container only
+  kill       docker kill ${NAME}
+  kill-demo  Start stress detached, wait 3s, kill, print stats
+  build      Build ${IMAGE} only
+
+Hard limits: cpus=${CPUS} memory=${MEMORY} pids=${PIDS}
+Emergency:   docker kill ${NAME}
+
+GUI launcher is separate — still requires --confirm; no multi-window GNOME.
+EOF
+}
+
+need_docker() {
+	command -v docker >/dev/null 2>&1 || die "docker required (or set PATH)"
+	docker info >/dev/null 2>&1 || die "docker daemon not reachable"
+}
+
+build_image() {
+	need_docker
+	docker build -q -t "$IMAGE" -f "$ROOT/Dockerfile" "$ROOT" >/dev/null
+}
+
+# Remove stale container of same name
+rm_stale() {
+	docker rm -f "$NAME" >/dev/null 2>&1 || true
+}
+
+run_foreground() {
+	local mode="$1"
+	local log rc
+	rm_stale
+	log=$(mktemp /tmp/flood-smoke.XXXXXX.log)
+	set +e
+	# No docker -t: keep stderr status separate from PTY flood body on stdout.
+	docker run --rm \
+		--name "$NAME" \
+		--cpus="$CPUS" \
+		--memory="$MEMORY" \
+		--memory-swap="$MEMORY" \
+		--pids-limit="$PIDS" \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=64m \
+		--tmpfs /dev/shm:rw,nosuid,size=64m \
+		-e FLOOD_IN_CONTAINER=1 \
+		-e PORT_BROADCAST_BIND=127.0.0.1 \
+		-e PORT_BROADCAST_PORT=4591 \
+		-v "$ROOT:/src:ro" \
+		-w /src \
+		"$IMAGE" \
+		"$mode" >"$log" 2>"$log.err"
+	rc=$?
+	set -e
+	# Status lines from the inner script go to container stderr (host sees these)
+	if [[ -s "$log.err" ]]; then
+		grep -E 'flood-smoke:|port-broadcast-shell:' "$log.err" >&2 || cat "$log.err" >&2
+	fi
+	if (( rc != 0 )); then
+		echo "flood-smoke-container: failed rc=$rc — last stdout:" >&2
+		tail -n 20 "$log" >&2 || true
+		rm -f "$log" "$log.err"
+		return "$rc"
+	fi
+	if [[ "$mode" == "drop" ]] && ! grep -q 'DONE_FLOOD_DROP' "$log" \
+		&& ! grep -q 'flood-smoke: drop OK' "$log.err"; then
+		echo "flood-smoke-container: drop missing DONE_FLOOD_DROP marker" >&2
+		tail -n 5 "$log" >&2 || true
+		rm -f "$log" "$log.err"
+		return 1
+	fi
+	if [[ "$mode" == "attach" ]] \
+		&& ! grep -qE 'flood-smoke: attach OK' "$log.err" \
+		&& ! grep -qE 'flood-smoke: attach OK' "$log"; then
+		echo "flood-smoke-container: attach did not report OK" >&2
+		tail -n 5 "$log.err" >&2 || true
+		rm -f "$log" "$log.err"
+		return 1
+	fi
+	rm -f "$log" "$log.err"
+	return 0
+}
+
+run_detached_stress() {
+	rm_stale
+	docker run -d \
+		--name "$NAME" \
+		--cpus="$CPUS" \
+		--memory="$MEMORY" \
+		--memory-swap="$MEMORY" \
+		--pids-limit="$PIDS" \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=64m \
+		--tmpfs /dev/shm:rw,nosuid,size=64m \
+		-e FLOOD_IN_CONTAINER=1 \
+		-e PORT_BROADCAST_BIND=127.0.0.1 \
+		-e PORT_BROADCAST_PORT=4591 \
+		-v "$ROOT:/src:ro" \
+		-w /src \
+		"$IMAGE" \
+		stress
+}
+
+case "$MODE" in
+	-h|--help|help)
+		usage
+		exit 0
+		;;
+	build)
+		build_image
+		echo "built $IMAGE"
+		;;
+	kill)
+		need_docker
+		docker kill "$NAME"
+		echo "killed $NAME"
+		;;
+	kill-demo)
+		need_docker
+		build_image
+		echo "flood-smoke-container: starting stress under ${CPUS} CPU / ${MEMORY} …" >&2
+		cid=$(run_detached_stress)
+		echo "flood-smoke-container: container=$cid name=$NAME" >&2
+		echo "flood-smoke-container: sleeping 3s (flood pegs container cgroup only) …" >&2
+		sleep 3
+		docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' "$NAME" 2>/dev/null || true
+		docker kill "$NAME" >/dev/null
+		docker rm -f "$NAME" >/dev/null 2>&1 || true
+		echo "flood-smoke-container: kill-demo OK — container gone; host not left with bare flood" >&2
+		;;
+	drop|attach)
+		if [[ "${FLOOD_ALLOW_HOST:-}" == "1" ]]; then
+			die "FLOOD_ALLOW_HOST is set but host flood is forbidden; unset it and use this wrapper"
+		fi
+		need_docker
+		build_image
+		echo "flood-smoke-container: mode=$MODE limits=cpus=${CPUS},mem=${MEMORY},pids=${PIDS}" >&2
+		echo "flood-smoke-container: emergency kill → docker kill ${NAME}" >&2
+		run_foreground "$MODE"
+		;;
+	stress)
+		if [[ "${FLOOD_ALLOW_HOST:-}" == "1" ]]; then
+			die "FLOOD_ALLOW_HOST is set but host flood is forbidden; unset it and use this wrapper"
+		fi
+		need_docker
+		build_image
+		echo "flood-smoke-container: mode=stress limits=cpus=${CPUS},mem=${MEMORY},pids=${PIDS}" >&2
+		cid=$(run_detached_stress)
+		echo "flood-smoke-container: detached $cid" >&2
+		echo "flood-smoke-container: stop with → docker kill ${NAME}" >&2
+		echo "flood-smoke-container: stats → docker stats ${NAME}" >&2
+		;;
+	*)
+		die "unknown mode: $MODE (try --help)"
+		;;
+esac

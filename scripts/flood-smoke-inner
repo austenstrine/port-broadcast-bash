@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Runs INSIDE the flood-smoke container only. Host wrapper refuses bare-metal.
+# Modes: drop | attach | stress | help
+set -euo pipefail
+
+if [[ "${FLOOD_IN_CONTAINER:-}" != "1" && ! -f /.dockerenv ]]; then
+	echo "flood-smoke-inner: refuse host run — use ./bin/flood-smoke-container" >&2
+	exit 2
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SHELL_HOP="${ROOT}/bin/port-broadcast-shell"
+BIND="${PORT_BROADCAST_BIND:-127.0.0.1}"
+PORT="${PORT_BROADCAST_PORT:-4591}"
+MODE="${1:-drop}"
+
+usage() {
+	cat <<'EOF'
+Usage: flood-smoke-inner <drop|attach|stress>
+
+  drop     Bounded urandom flood with no nc client (PTY must not stall)
+  attach   Bounded flood with nc attached (full-fidelity clone path)
+  stress   Unbounded flood until killed (for docker kill demos)
+
+Env: PORT_BROADCAST_BIND PORT_BROADCAST_PORT
+EOF
+}
+
+[[ -x "$SHELL_HOP" ]] || { echo "missing hop: $SHELL_HOP" >&2; exit 1; }
+
+case "$MODE" in
+	-h|--help|help)
+		usage
+		exit 0
+		;;
+	drop)
+		echo "flood-smoke: mode=drop bind=${BIND} port=${PORT} (no nc)" >&2
+		# ~12 MiB raw → base64 on the PTY (clone sink must absorb/drop without stalling).
+		# Host wrapper discards container stdout so the agent TTY is not flooded.
+		"$SHELL_HOP" -b "$BIND" -p "$PORT" -- \
+			bash -c 'dd if=/dev/urandom bs=64k count=200 status=none 2>/dev/null | base64; echo DONE_FLOOD_DROP'
+		echo "flood-smoke: drop OK" >&2
+		;;
+	attach)
+		echo "flood-smoke: mode=attach bind=${BIND} port=${PORT}" >&2
+		tmpdir=$(mktemp -d /tmp/flood-attach.XXXXXX)
+		nc_pid=""
+		cleanup_attach() {
+			[[ -n "${nc_pid:-}" ]] && kill "$nc_pid" 2>/dev/null || true
+			rm -rf "$tmpdir"
+		}
+		trap cleanup_attach EXIT
+		# Drainer retries connect until the hop listener is up, then pulls clone bytes.
+		(
+			: >"$tmpdir/nc.out"
+			for _ in $(seq 1 100); do
+				if nc -n "$BIND" "$PORT" >>"$tmpdir/nc.out" 2>/dev/null; then
+					exit 0
+				fi
+				sleep 0.05
+			done
+			exit 1
+		) &
+		nc_pid=$!
+		"$SHELL_HOP" -b "$BIND" -p "$PORT" -- \
+			bash -c 'sleep 0.8; dd if=/dev/urandom bs=64k count=100 status=none 2>/dev/null | base64; echo DONE_FLOOD_ATTACH'
+		# Hop exited → listener gone; stop nc if still hanging
+		sleep 0.3
+		kill "$nc_pid" 2>/dev/null || true
+		wait "$nc_pid" 2>/dev/null || true
+		nc_pid=""
+		bytes=$(wc -c <"$tmpdir/nc.out" 2>/dev/null | tr -d ' ' || echo 0)
+		if [[ "${bytes:-0}" -lt 100 ]] && ! grep -q 'DONE_FLOOD_ATTACH' "$tmpdir/nc.out" 2>/dev/null; then
+			echo "flood-smoke: attach FAIL (nc bytes=${bytes:-0})" >&2
+			exit 1
+		fi
+		echo "flood-smoke: attach OK (nc bytes=${bytes})" >&2
+		;;
+	stress)
+		echo "flood-smoke: mode=stress — peg container CPU until docker kill" >&2
+		echo "flood-smoke: kill with: docker kill port-broadcast-flood-smoke" >&2
+		"$SHELL_HOP" -b "$BIND" -p "$PORT" -- \
+			bash -c 'while true; do dd if=/dev/urandom bs=1M count=4 status=none 2>/dev/null | base64 >/dev/null; done'
+		;;
+	*)
+		echo "flood-smoke-inner: unknown mode: $MODE" >&2
+		usage >&2
+		exit 2
+		;;
+esac

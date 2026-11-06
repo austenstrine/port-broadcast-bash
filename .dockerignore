@@ -1,0 +1,7 @@
+.git
+.vscode
+*.log
+*~
+*.swp
+.DS_Store
+typescript
