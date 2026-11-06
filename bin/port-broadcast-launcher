@@ -20,7 +20,7 @@
 #   ./bin/port-broadcast-launcher --dry-run --smoke
 #   ./bin/port-broadcast-launcher --smoke --confirm          # 1-tab GUI (Austen OK)
 #   ./bin/port-broadcast-launcher --tabs 6 --confirm
-#   ./bin/port-broadcast-launcher --tabs 3 --confirm --tab-cmd 2='npm run dev'
+#   ./bin/port-broadcast-launcher --tabs 3 --confirm --tab-cmd 2='npm run dev' --tab-alias 2=dev
 #   ./bin/port-broadcast-launcher --ports 4591,4600,4700 --confirm
 #   ./bin/port-broadcast-launcher --config ./tabs.conf --confirm
 #   ./bin/port-broadcast-launcher --dry-run --tabs 6 --confirm -- dssh logs backend
@@ -46,6 +46,8 @@ TERM_BIN=""
 TERM_KIND=""
 # Per-tab command overrides keyed by 1-based index (sparse). Empty string = interactive.
 declare -A TAB_CMD=()
+# Per-tab display aliases (terminal tab titles). Ports stay the attach identity.
+declare -A TAB_ALIAS=()
 declare -a PORT_LIST=()
 
 usage() {
@@ -66,6 +68,9 @@ Options:
   -b, --bind ADDR           Listen address (default: 127.0.0.1, or PORT_BROADCAST_BIND)
       --cmd CMD             Default command for every tab without --tab-cmd (shell -c)
       --tab-cmd INDEX=CMD   Per-tab command (1-based; repeatable). Empty CMD = interactive
+      --tab-alias INDEX=NAME
+                            Per-tab terminal title (1-based; repeatable). Prefer this over
+                            the default pb:<port> label — ports stay for nc attach only.
   -c, --config FILE         Load tabs/ports/cmds from a config file (see README)
       --confirm, -y         Required for any real GUI launch (prevents accidental spawn)
       --smoke               1-tab short-lived smoke; implies --tabs 1
@@ -82,6 +87,8 @@ Config file (KEY=VALUE, # comments):
   cmd=echo default
   tab.1=
   tab.2=npm run dev
+  alias.1=rlog
+  alias.2=dev
 
 Agent attach (after launch):
   nc 127.0.0.1 4591
@@ -152,6 +159,31 @@ resolve_terminal() {
 # One-shot / restart tab commands are wrapped with a trailing interactive shell
 # *inside* the hop (`cmd; exec bash`) so the tab, scrollback, and TCP listen
 # stay up after the command finishes — previously those tabs vanished.
+# Keep the launcher-chosen tab title sticky: Ubuntu bashrc embeds an OSC-0
+# title in PS1 (user@host:cwd), and Ptyxis honors OSC titles by default.
+write_title_rcfile() {
+	local path="$1"
+	cat >"$path" <<'EOF'
+# port-broadcast tab title rc — sourced instead of a bare interactive bash.
+if [[ -f "${HOME}/.bashrc" ]]; then
+	# shellcheck disable=SC1090
+	source "${HOME}/.bashrc"
+fi
+# Drop OSC 0/2 sequences that bashrc embeds in PS1 (ESC ] 0|2 ; … BEL).
+PS1="$(printf '%s' "${PS1-}" | sed $'s/\x1b\\][02];[^\x07]*\x07//g')"
+# Leftover empty non-printing wrappers from the stripped OSC.
+PS1="${PS1//\\[\\]/}"
+if [[ -n "${PORT_BROADCAST_TAB_TITLE:-}" ]]; then
+	printf '\033]0;%s\007' "$PORT_BROADCAST_TAB_TITLE"
+	if [[ "$(declare -p PROMPT_COMMAND 2>&1)" =~ "declare -a" ]]; then
+		PROMPT_COMMAND+=('printf "\033]0;%s\007" "$PORT_BROADCAST_TAB_TITLE"')
+	else
+		PROMPT_COMMAND='printf "\033]0;%s\007" "$PORT_BROADCAST_TAB_TITLE"; '"${PROMPT_COMMAND-}"
+	fi
+fi
+EOF
+}
+
 exec_tab() {
 	local state_dir="" port="" bind="$BIND" index=""
 	while [[ $# -gt 0 ]]; do
@@ -180,9 +212,25 @@ exec_tab() {
 	[[ -n "$state_dir" && -n "$port" ]] || die "exec-tab requires --state DIR -p PORT"
 	local -a extra=()
 	local cmd_file="$state_dir/cmd"
+	local title=""
+	local rcfile=""
 	if [[ -n "$index" && -f "$state_dir/cmd.$index" ]]; then
 		cmd_file="$state_dir/cmd.$index"
 	fi
+	if [[ -n "$index" && -f "$state_dir/title.$index" ]]; then
+		title="$(<"$state_dir/title.$index")"
+		title="${title%%$'\n'}"
+	elif [[ -f "$state_dir/title" ]]; then
+		title="$(<"$state_dir/title")"
+		title="${title%%$'\n'}"
+	fi
+	if [[ -z "$title" ]]; then
+		title="pb:${port}"
+	fi
+	export PORT_BROADCAST_TAB_TITLE="$title"
+	printf '\033]0;%s\007' "$title"
+	rcfile="$state_dir/bashrc${index:+.$index}"
+	write_title_rcfile "$rcfile"
 	if [[ -f "$cmd_file" && -s "$cmd_file" ]]; then
 		# shellcheck disable=SC1090
 		source "$cmd_file"
@@ -191,10 +239,10 @@ exec_tab() {
 	if ((${#extra[@]})); then
 		local run_line
 		run_line="$(printf '%q ' "${extra[@]}")"
-		exec "$SHELL_HELPER" -b "$bind" -p "$port" -- bash -c \
-			"${run_line}"$'\n'"printf 'port-broadcast: command finished (port %s); keeping hop open\\n' $(printf '%q' "$port") >&2"$'\n'"exec \"\${SHELL:-bash}\" -i"
+		exec "$SHELL_HELPER" -b "$bind" -p "$port" -- bash --rcfile "$rcfile" -c \
+			"${run_line}"$'\n'"printf 'port-broadcast: command finished (port %s); keeping hop open\\n' $(printf '%q' "$port") >&2"$'\n'"exec \"\${SHELL:-bash}\" --rcfile $(printf '%q' "$rcfile") -i"
 	fi
-	exec "$SHELL_HELPER" -b "$bind" -p "$port"
+	exec "$SHELL_HELPER" -b "$bind" -p "$port" -- bash --rcfile "$rcfile" -i
 }
 
 if [[ "${1:-}" == "--exec-tab" ]]; then
@@ -250,6 +298,12 @@ load_config() {
 				[[ "$idx" =~ ^[0-9]+$ ]] || die "config: bad tab key: $key"
 				TAB_CMD["$idx"]=$val
 				;;
+			alias.*)
+				idx="${key#alias.}"
+				[[ "$idx" =~ ^[0-9]+$ ]] || die "config: bad alias key: $key"
+				[[ -n "$val" ]] || die "config: empty alias for $key"
+				TAB_ALIAS["$idx"]=$val
+				;;
 			*)
 				die "config: unknown key: $key"
 				;;
@@ -304,6 +358,16 @@ while [[ $# -gt 0 ]]; do
 			[[ "$spec" == *=* ]] || die "--tab-cmd needs INDEX=command (got: $spec)"
 			[[ "$idx" =~ ^[0-9]+$ ]] || die "--tab-cmd index must be 1-based integer"
 			TAB_CMD["$idx"]=$rest
+			shift 2
+			;;
+		--tab-alias)
+			spec="${2:?missing INDEX=name}"
+			idx="${spec%%=*}"
+			rest="${spec#*=}"
+			[[ "$spec" == *=* ]] || die "--tab-alias needs INDEX=name (got: $spec)"
+			[[ "$idx" =~ ^[0-9]+$ ]] || die "--tab-alias index must be 1-based integer"
+			[[ -n "$rest" ]] || die "--tab-alias name must be non-empty"
+			TAB_ALIAS["$idx"]=$rest
 			shift 2
 			;;
 		-c|--config)
@@ -389,6 +453,9 @@ FIRST_PORT="${PORT_LIST[0]}"
 for idx in "${!TAB_CMD[@]}"; do
 	((idx >= 1 && idx <= TABS)) || die "--tab-cmd index $idx out of range 1..$TABS"
 done
+for idx in "${!TAB_ALIAS[@]}"; do
+	((idx >= 1 && idx <= TABS)) || die "--tab-alias index $idx out of range 1..$TABS"
+done
 
 # Real GUI launch always needs --confirm (incl. 1-tab / --smoke) after prior crashes.
 if ((DRY_RUN == 0 && CONFIRM == 0)); then
@@ -418,6 +485,10 @@ for ((i = 0; i < TABS; i++)); do
 	port="${PORT_LIST[$i]}"
 	idx=$((i + 1))
 	cmd_note="interactive"
+	alias_note="pb:${port}"
+	if [[ -n "${TAB_ALIAS[$idx]+x}" && -n "${TAB_ALIAS[$idx]}" ]]; then
+		alias_note="${TAB_ALIAS[$idx]}"
+	fi
 	if [[ -n "${TAB_CMD[$idx]+x}" ]]; then
 		if [[ -z "${TAB_CMD[$idx]}" ]]; then
 			cmd_note="interactive"
@@ -427,7 +498,7 @@ for ((i = 0; i < TABS; i++)); do
 	elif ((${#DEFAULT_CMD[@]})); then
 		cmd_note="cmd: ${DEFAULT_CMD[*]}"
 	fi
-	echo "  tab ${idx}: nc ${BIND} ${port}  (${cmd_note})" >&2
+	echo "  tab ${idx}: ${alias_note}  nc ${BIND} ${port}  (${cmd_note})" >&2
 	if ((DRY_RUN == 0)); then
 		if ss -ltn "( sport = :$port )" 2>/dev/null | grep -q ":${port} "; then
 			die "port ${port} already in use"
@@ -453,6 +524,10 @@ for ((i = 0; i < TABS; i++)); do
 	port="${PORT_LIST[$i]}"
 	idx=$((i + 1))
 	title="pb:${port}"
+	if [[ -n "${TAB_ALIAS[$idx]+x}" && -n "${TAB_ALIAS[$idx]}" ]]; then
+		title="${TAB_ALIAS[$idx]}"
+	fi
+	printf '%s\n' "$title" >"$STATE_DIR/title.$idx"
 	runner="$STATE_DIR/run-${port}"
 	cat >"$runner" <<EOF
 #!/usr/bin/env bash
@@ -476,7 +551,7 @@ BOOT=""
 case "$TERM_KIND" in
 	ptyxis)
 		for ((i = 0; i < TABS; i++)); do
-			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"-T"$'\t'"${TITLES[$i]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[$i]}")
+			LAUNCH_STEPS+=("$i"$'\t'"$TERM_BIN"$'\t'"--tab"$'\t'"--title=${TITLES[$i]}"$'\t'"-d"$'\t'"$ROOT"$'\t'"-x"$'\t'"${RUNNERS[$i]}")
 		done
 		;;
 	kgx)
